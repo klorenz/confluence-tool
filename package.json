@@ -1,6 +1,6 @@
 {
   "name": "confluence-tool",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "library to access atlassian REST API",
   "main": "index.js",
   "scripts": {
