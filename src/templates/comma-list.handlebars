@@ -1,0 +1,7 @@
+{{#each list}}
+  {{#if @last}}
+    {{> (lookup . "type")}}
+  {{else}}
+    {{> (lookup . "type")}},
+  {{/if}}
+{{/each}}
