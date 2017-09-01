@@ -25,9 +25,11 @@
     "cheerio": "^1.0.0-rc.2",
     "coffeescript": "^1.12.7",
     "handlebars": "^4.0.10",
+    "js-yaml": "^3.9.1",
     "loophole": "^1.1.0",
     "netrc": "^0.1.4",
-    "request": "^2.81.0"
+    "request": "^2.81.0",
+    "yargs": "^8.0.2"
   },
   "devDependencies": {
     "jasmine-node": "^1.14.5"

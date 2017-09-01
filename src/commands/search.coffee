@@ -21,7 +21,7 @@ module.exports =
     client.eachPage client.resolveCQL(argv.query), (page) ->
       if argv.yaml
         if not first
-          process.stdout.write "--\n"
+          process.stdout.write "---\n"
         process.stdout.write YAML.safeDump page
         first = false
       else

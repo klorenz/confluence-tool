@@ -1,11 +1,4 @@
-# turn value into promise in case it isnt one
-promised = (value) ->
-  if value instanceof Function
-    value = value()
-  if value not instanceof Promise
-    Promise.resolve(value)
-  else
-    value
+{promised} = require "./util"
 
 # http://promise-nuggets.github.io/articles/15-map-in-series.html
 Promise.iterate = (funcs, callback) ->

@@ -2,36 +2,49 @@ ConfigManager = require '../config-manager.coffee'
 YAML = require 'js-yaml'
 
 module.exports =
-  command: 'page-prop-set <query> [property..]'
+  command: 'page-prop-set [<query>] [<property>..]'
   desc: '''
     Add a label to selected pages.
 
-    Example:
-
-      $0 page-prop-set "label = foo" -p Type "Some Type" -p AnotherKey AnotherValue
   '''
-
   builder: (yargs) ->
     yargs
-    .option 'prop'
-      alias: 'p'
-      nargs: 2
-      help: "this option takes two args NAME and VALUE"
-
-  # builder: (yargs) ->
-  #   yargs
-  #   .option 'config',
-  #     alias: 'c'
-  #     demandCommand: false
-  #     help: "configuration name, if you have multiple configurations"
-  #     default: 'default'
+    .example '''
+      $0 page-prop-set "label = foo" Type="Some Type" AnotherKey="AnotherValue"
+    ''', "Set some page properties"
 
   handler: (argv) ->
+    console.log argv
+    process.exit()
     config = new ConfigManager
     client = config.getConfluenceAPI(argv.config)
 
-    client.addLabels client.resolveCQL(argv.query), argv.label, (page, data) =>
-      if data.statusCode
-        process.stdout.write "#{page.id} #{page.spaceKey} #{page.title}: error #{data.statusCode} #{data.message}\n"
-      else
-        process.stdout.write "#{page.id} #{page.spaceKey} #{page.title}: ok\n"
+    properties = {}
+
+    if argv.property.length
+      for prop in argv.properties
+        if m = prop.match /(.*?)=(.*)/
+          properties[m[1]] = m[2]
+
+      {page} = argv.query
+
+      setPageProperties {page, properties}
+      .then ->
+        echo "ok"
+        process.exit 0
+      .catch (error) ->
+        echo "#{error}"
+        process.exit 1
+    else
+      didReadStdin.then (input) ->
+        YAML.safeLoadAll input, (rec) ->
+          if page
+            if rec instanceof Array
+              rec.map (value) -> value.page = page
+            else
+              rec.page = page
+
+            if rec.cql
+              delete rec.cql
+
+          setPageProperties rec

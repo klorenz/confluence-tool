@@ -1,17 +1,19 @@
-fs = require 'fs'
+#!/usr/bin/env coffee
+#fs = require 'fs'
 
 extensions = ['coffee']
 if __filename.endsWith('cli.js')
     extensions = ['js']
 
-yargs = require('yargs')
-  .usage '$ [global-options] command [options]'
+require('yargs')
+  .usage '$0 [global-options] command [options]'
   .option 'config',
-      alias: 'c'
-      demandCommand: false
-      help: "configuration name, if you have multiple configurations"
-      default: 'default'
-  .commandDir './commands', extensions: extensions
+    alias: 'c'
+    demandCommand: false
+    help: "configuration name, if you have multiple configurations"
+    default: 'default'
+
+  .commandDir "#{__dirname}/commands", extensions: extensions
   .demandCommand()
   .help()
   .argv

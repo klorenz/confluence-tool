@@ -2,6 +2,9 @@ request = require 'request'
 extend  = require('util')._extend
 StorageEditor = require './storage-editor'
 PagePropEditor = require './page-prop-editor'
+{jQuery} = StorageEditor
+
+{isHtml, promised} = require './util'
 require './promise-patch'
 
 
@@ -27,8 +30,6 @@ class ConfluenceAPI
     @jar = request.jar()
 
   request: (method, path, options) ->
-    #console.log "request", method, path, options
-
     opts = extend {}, options or {}
     opts.jar = @jar
     if path.match /^\//
@@ -43,24 +44,21 @@ class ConfluenceAPI
       request[method] opts, (error, response, body) =>
         if error
           reject error
-        else if response.statusCode >= 400
-          err = new Error "#{response.statusCode}: #{response.statusMessage}"
-          err.response = response
-          reject err
         else
-          if typeof body is "string"
-            #console.log "turnted to JSON"
+          debugger
+          try
             body = JSON.parse body
-          else
-            #console.log "isnt string"
 
-          if body.statusCode? >= 400
-            err = new Error "#{json.statusCode}: #{json.message}"
-            err.data = body
+            if body.statusCode? and body.statusCode >= 400
+              err = new Error "#{body.statusCode}: #{body.message}"
+              err.data = body
+              reject err
+            else
+              resolve body
+          catch e
+            err = new Error "#{response.statusCode}: #{response.statusMessage}"
+            err.response = response
             reject err
-          else
-            #console.log "body type", body.constructor
-            resolve body
 
   get: (path, options) ->
     @request 'get', path, options
@@ -135,21 +133,35 @@ class ConfluenceAPI
 
   # resolve some string variants to CQL queries
   #
-  # - `ref` - 'SPACE:page title', '<page ID>'
+  # * `ref` - resolve to a valid CQL
+  #   * `SPACE:page title` ->  `space = SPACE AND title = "page title"`
+  #   * `:page title` -> `title = "page title"`
+  #   * `1234567` -> `ID = 1234567`
+  #   * ends with `api/content/12345` -> `ID = 12345`
+  #   * else assume `ref` is already CQL
+  #
   resolveCQL: (ref) ->
     if typeof ref isnt "string"
       ref = ref.toString()
 
     if mob = ref.match /^([A-Z]*):(.*)/
-      return "space = #{mob[1]} AND title = \"#{mob[2]}\""
+      value = "space = #{mob[1]} AND title = \"#{mob[2]}\""
 
-    if mob = ref.match /^(\d+)$/
-      return "ID = #{mob[1]}"
+    else if mob = ref.match /^:(.*)/
+      value = "title = \"#{mob[2]}\""
 
-    if mob = ref.match /api\/content\/(\d+)$/
-      return "ID = #{mob[1]}"
+    else if mob = ref.match /^(\d+)$/
+      value = "ID = #{mob[1]}"
 
-    return ref
+    else if mob = ref.match /api\/content\/(\d+)$/
+      value = "ID = #{mob[1]}"
+
+    else
+      value = ref
+
+    #console.log "value", value
+
+    return value
 
   # Section: Pages
 
@@ -159,8 +171,11 @@ class ConfluenceAPI
   #   confluence REST API
   getPage: (page_ref, expand='') ->
     new Promise (resolve, reject) =>
+      #console.log "page_ref", page_ref
       @search @resolveCQL(page_ref), {expand}
       .then (result) =>
+        #console.log "result", result
+
         if result['size'] > 1
           reject new Error "ambigious query returned more than one page"
 
@@ -168,43 +183,48 @@ class ConfluenceAPI
           reject new Error "page does not exist"
 
         resolve result['results'][0]
-      .catch (error) =>
-        reject error
+      .catch(reject)
 
 
   # find pages
   #
   # - `query` must be a CQL
   search: (query, options) ->
+    #console.log "search", query
     @get "/rest/api/content/search", qs: (extend {cql: query}, options)
 
   eachPage: (query, options, callback) ->
+    #console.log "each page", query, options
     if options instanceof Function
       callback = options
       options = {}
 
     new Promise (resolve, reject) =>
       getPages = (opts) =>
-        @search(query, opts).then (data) =>
-          #console.log "search data", data.constructor, data
+        @search(query, opts)
+        .then (data) =>
+          #console.log "search data", query, opts
+          #console.log "results", data
 
-          #console.log "results", data.results
+          promises = []
+
           for page in data['results']
             page.spaceKey = page._expandable.space.match(/\/([^\/]*)$/)[1]
             #console.log "handle", page
             if callback
-              callback(page)
+              promises.push promised callback page
 
-          if data['size'] < data['limit']
-            resolve()
-          else
-            _opts = extend {}, opts
-            _opts.start += _opts.limit
+          Promise.all promises
+          .then ->
+            if data['size'] < data['limit']
+              resolve()
+            else
+              _opts = extend {}, opts
+              _opts.start += _opts.limit
 
-            getPages(_opts)
-
-        .catch (error) =>
-          reject(error)
+              getPages(_opts)
+          .catch(reject)
+        .catch(reject)
 
       getPages extend {start: 0, limit: 25}, options
 
@@ -241,79 +261,177 @@ class ConfluenceAPI
       .catch (error) =>
         reject({error, errors, succeeded})
 
-  # Section: Page Properties
+
   getPageProperties: (cql, options, callback) ->
     if not callback and options instanceof Function
       callback = options
       options = {}
 
-    pagesPerSpace = {}
+    bodyType  = options.bodyType ? "view"
+    stripTags = options.stripTags ? true
 
+    @eachPage cql, {expand: "body.#{bodyType}"}, (page) =>
+      page.properties = props = {}
+      $=jQuery(page.body.view.value)
+
+      didCallback = []
+
+      $("div[data-macro-name=details] table > tbody th").each (i,elem) =>
+        key = $(elem).text().trim()
+
+        if stripTags
+          extractData = ($e) =>
+            $x = $e.find('li, table th + td')
+
+            if $x.length
+              if $x.get(0).tagName is 'li'
+                value = $e.find('li').map((i,e) -> extractData $(e)).get()
+              else
+                value = {}
+                $e.find('table th').each (i,e) =>
+                  value[$(e).text().trim()] = extractData $(e).next()
+            else
+              value = $e.text().trim()
+
+            return value
+
+          value = extractData $(elem).next()
+        else
+          value = $(elem).next().html()
+
+        props[key] = value
+
+      if callback
+        didCallback.push promised callback props, page
+
+      Promise.all didCallback
+
+
+
+  # Section: Page Properties
+  getPageProperties2: (cql, options, callback) ->
+    if not callback and options instanceof Function
+      callback = options
+      options = {}
+
+    # setup set of heading (property keys) to retrieve
+    keys = options.keys or []  # beware!  keys are case sensitive
+    headingQS = {}
+    if keys.length
+      headingQS['headings'] = keys.join(',')
+
+    # property (masterdetail) queries must be done per space, so first find out
+    # about all pages and the spaces they are in
+    pagesPerSpace = {}
     new Promise (resolve, reject) =>
+
+      # first collect pages using CQL to find out about the spaces
       @eachPage cql, (page) ->
+        #console.log "pageid", page.id
         if not pagesPerSpace[page.spaceKey]
           pagesPerSpace[page.spaceKey] = []
 
         pagesPerSpace[page.spaceKey].push page.id
 
       .then =>
-        keys = options.keys or []  # beware!  keys are case sensitive
-
-        headingQS = {}
-        if keys.length
-          headingQS['headings'] = keys.join(',')
-
-        promises = []
+        # collect all space
+        gotSpaceSet = []
 
         for spaceKey, pageIds of pagesPerSpace
           do (spaceKey) =>
-            cql = "ID in (#{pageIds.join(", ")})"
+            # devide pageId list into chunks of 25.  Looks like there is some
+            # limit in retrieving data
+            chunks = []
+            for i in [0...pageIds.length] by 25
+              chunks.push pageIds[i...(i+25)]
 
-            qs = extend {spaceKey, cql}, headingQS
-            #console.log "qs", qs
+            # retrieve chunk one by one
+            gotSpaceSet.push Promise.iterate chunks.map (chunk) =>
+              cql = "ID in (#{chunk.join(", ")})"
+              qs = extend {spaceKey, cql}, headingQS
 
-            promises.push( @get "/rest/masterdetail/1.0/detailssummary/lines", {qs}
-            .then (result) =>
-              headings = result['renderedHeadings']
-              #console.log "result", result
+              @get "/rest/masterdetail/1.0/detailssummary/lines", {qs}
+              .then (result) =>
+                new Promise (resolve, reject) =>
+                  headings = result['renderedHeadings']
+                  didCallback = []
 
-              for rec in result['detailLines']
+                  # if result.asyncRenderSafe is false
+                  #   # OMG! get data in a different way, mimic masterdetail result
+                  #   result = {cql, spaceKey}
+                  #
+                  #   detailLines = []
+                  #   Promise.iterate chunks.map (pageId) =>
+                  #     @getPage pageId, 'body.view' (result) =>
+                  #       $=jQuery(result.body.view)
+                  #       details = []
+                  #       for heading in headings
+                  #         elems = $("div[data-macro-name=details] table > tbody th:contains(#{heading}) + td")
+                  #         if elems.length
+                  #           details.push elems[0]
+                  #         else
+                  #           details.push ''
+                  #
+                  #       detailLines.push {
+                  #         id: result.id
+                  #         title: result.title
+                  #         relativeLink: result._links.webui
+                  #         details: details
+                  #         # likesCount
+                  #         # commentsCount
+                  #       }
+                  #
+                  #     if callback
+                  #       didCallback.push promised callback props, rec
+                  #   .then
+                  #
+                  #   #@eachPage chunk
+                  #
+                  # else
+                  result.cql = cql
+                  result.spaceKey = spaceKey
 
-                #console.log "rec", rec
-                rec['properties'] = props = {}
+                  for rec in result['detailLines']
 
-                rec.spaceKey = spaceKey
+                    rec['properties'] = props = {}
 
-                # zip properties into array
-                for i in [0...headings.length]
-                  props[headings[i]] = rec.details[i]
+                    rec.spaceKey = spaceKey
 
-                if callback
-                  callback props, rec
+                    # zip properties into array
+                    for i in [0...headings.length]
+                      props[headings[i]] = rec.details[i]
 
-              result
-            .catch (error) ->
-              console.log error
-              reject error
+                    if callback
+                      didCallback.push promised callback props, rec
 
-            )
+                  # make sure all callbacks are finished, bifore this resolves
+                  Promise.all didCallback
+                  .then ->
+                    resolve result
+                  .catch(reject)
 
-        Promise.all promises
-        .then (values) ->
+              .catch(reject)
+
+        Promise.all gotSpaceSet
+        .then (results) ->
+          #console.log "results", results
           result =
             currentPage: 0
             totalPages: 0
-            renderedHeadings: values[0].renderedHeadings
+            renderedHeadings: results[0].renderedHeadings
             detailLines: []
             asyncRenderSafe: true
 
-          for value in values
+          for value in results
+            #console.log "value", results
+            continue unless value.detailLines
             for detail in value.detailLines
               result.detailLines.push detail
 
           resolve result
-        .catch (error) ->
-          reject error
+        .catch(reject)
+      .catch(reject)
+
 
   updatePage: (page) ->
     {id, title} = page
@@ -325,59 +443,102 @@ class ConfluenceAPI
       else
         version = number: parseInt(page.version) + 1
 
-    console.log "spaceKey", page.spaceKey
+    # page.spaceKey is undefined here
+    #console.log "spaceKey", page.spaceKey
     #space = page.space.key
 
+    representation = null
+    value = null
+
+    # be generous in specifying the content
     if page.newBody
-      body =
-        storage:
-          value: page.newBody
-          representation: 'storage'
+      value = page.newBody
 
     else if typeof page.body is 'string'
-      body =
-        storage:
-          value: page.body
-          representation: 'storage'
+      value = page.body
 
-    type = 'page'
-    data = {id, title, type, version, body}
+    else if typeof page.body.storage is 'string'
+      value = page.body.storage
+
+    else if page.body.storage # assume data is setup correct
+      {value, representation} = page.body.storage
+
+
+    type = page.type or 'page'
+
+    data = {id, title, type, version}
+
+    if value?
+      representation ?= if isHtml(value) then 'storage' else 'wiki'
+      data.body = storage: {value, representation}
+
     #console.log "updatePage", data
 
     @put "/rest/api/content/#{id}", json: data
 
-
   # Public: edito a page
   #
-  # - `page` page to edit
-  # - `editor` must have an edit method or must be a function.  Edit method or
-  #   function is called with content as parameter and must return either the
-  #   new content or a promise resolving to the new content.
+  # * `page` page to edit, may be a page object as returned from confluence or
+  #   "SPACE:Title", or 123456 (page id) or a CQL resolving to one page. Although
+  #   named page here, it may be also a 'blog' post.  Any spec will be resolved
+  #   to page object, which then is passed to page editor if any.
+  #
+  # * `editor` - can be one of the following
+  #
+  #   - {Object} having a method `edit`, or a {Function} which gets page object
+  #     as parameter.  It can resolve to one of the following items.
+  #   - {Promise} to get one of the following items.
+  #   - {String} new content of page
+  #   - {Object} updating given page object, so usually it should have
+  #     - new `title` to rename page
+  #     - `newBody` to update the body
+  #   - page {Object} as returned from confluence REST having maybe `newBody`
+  #     as new body.  If not present, then usual `body` field will be interpreted
+  #     as new body.
+  #
+  #  `representation` of the body will be guessed.  If is HTML, then it will
+  #  be `storage`, else `wiki`.
   #
   editPage: (page, editor) ->
+    #console.log "page", page
     new Promise (resolve, reject) =>
       if typeof page is 'object' and page.version and page.body
-        promise = Promise.resolve(page)
+        gotPage = Promise.resolve(page)
       else
-        promise = @getPage page, 'version,body.storage'
+        gotPage = @getPage page, 'version,body.storage'
 
-      promise
+      gotPage
       .then (page) =>
+        #console.log "got page", page
+        value = null
 
         if editor.edit
-          edited = editor.edit page
-        else
-          edited = editor page
+          if typeof editor.edit is 'function'
+            value = editor.edit page
+          else
+            myEditor = new StorageEditor
+            value = myEditor.edit page, editor.edit
 
-        if not (edited instanceof Promise)
-          edited = Promise.resolve(edited)
+        else if typeof editor is 'function'
+          value = editor page
+        else
+          value = editor
+
+        if not (value instanceof Promise)
+          edited = Promise.resolve(value)
 
         edited
-        .then (page) =>
-          @updatePage page
+        .then (value) =>
+          if typeof value is 'string'
+            updatedPage = extend page {newBody: editor}
+          else if typeof editor is 'object'
+            updatedPage = extend page, value
+
+          @updatePage updatedPage
           .then(resolve).catch (error) ->
-             console.log(error)
+             #console.log(error)
              reject(error)
+      .catch(reject)
 
   # promise to resolve the query for a user
   #
@@ -492,19 +653,34 @@ class ConfluenceAPI
     if options not instanceof Array
       options = [ options ]
 
+    #console.log "options", options
+
     Promise.iterate options.map (option) =>
-      @preparePageProperties(option.properties)
-      .then =>
-        pagePropEditor = new PagePropEditor options
+      new Promise (resolve, reject) =>
+        @preparePageProperties(option.properties)
+        .then =>
+          if option.cql and option.page
+            thow new Error "You may only pass either 'cql' or 'page'"
 
-        if option.cql and option.page
-          thow new Error "You may only pass either 'cql' or 'page'"
+          #console.log "apply", option
 
-        cql = option.cql or @resolveCQL option.page
-        @eachPage cql, {expand: 'version,body.storage'}, (page) =>
-          @editPage page.id, pagePropEditor
-          .then (value) ->
-            callback (value)
+          pagePropEditor = new PagePropEditor option
+
+          cql = option.cql or @resolveCQL option.page
+          @eachPage cql, {expand: 'version,body.storage'}, (page) =>
+            #console.log "handle page", page.id
+
+            new Promise (resolve, reject) =>
+              @editPage page.id, pagePropEditor
+              .then (value) ->
+                if callback
+                  callback value
+                resolve value
+              .catch(reject)
+          .then(resolve)
+          .catch(reject)
+
+        .catch(reject)
 
 
 

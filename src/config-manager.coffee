@@ -1,4 +1,4 @@
-{ConfluenceAPI} = require 'atlassian-confluence-api'
+{ConfluenceAPI} = require './confluence-api'
 os = require 'os'
 fs = require 'fs'
 YAML = require 'js-yaml'

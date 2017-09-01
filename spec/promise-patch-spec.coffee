@@ -1,6 +1,6 @@
 require '../src/promise-patch'
 
-fdescribe "Promise Patch", ->
+describe "Promise Patch", ->
   describe "Promise patch iterate", ->
     it "can run functions sequentially", ->
 
