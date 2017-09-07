@@ -34,7 +34,7 @@ fixHtml = (s) ->
 cleanHtml = (s) ->
   data = cheerio.load s, xmlMode: true
   transformNamespaces "--", "*", data('*')
-  data.html()
+  cheerioOrig['html'].call data.root()
 
 knownNamespaces = []
 
@@ -78,8 +78,15 @@ for method in ['html']
     cheerio::[method] = (args...) ->
       if args.length
         args = args.map (arg) -> fixHtml arg
-      result = cheerioOrig[method].call this, args...
-      cleanHtml result
+      # elem = this
+      # if not elem[0] and not elem.children
+      #   elem = elem.root()
+      result = cheerioOrig[method].apply this, args
+
+      if typeof result is 'string'
+        cleanHtml result
+      else
+        result
 
 
 # Public: provide a jQuery-like storage-format editor
@@ -135,11 +142,14 @@ class StorageEditor
   # This method will be called from an editor passed to {ConfluenceAPI::editPage}.
   # You can change content or title.
   #
-  # * `page` {Object}
-  #   * `body.storage` {String} storage representation
-  #   * `spaceKey` {String} Space key of page to edit
-  #   * `title` {String} Title of page to edit
-  # * `options` {Object} - optional can be ignored if overridden.  The original
+  # page - {Object}
+  #   :body - {Object}
+  #     :storage - {Object}
+  #        :value - {String} storage representation
+  #
+  #   :spaceKey - {String} Space key of page to edit
+  #   :title - {String} Title of page to edit
+  # options - {Object} optional can be ignored if overridden.  The original
   #   edit may have have a field `edit`, which contains an array of following
   #   {Object}:
   #
@@ -158,20 +168,16 @@ class StorageEditor
   #
   #   This will result in following jQuery call:
   #
-  #   ```coffee
-  #   $(select)[action](content)
-  #   ```
+  #      $(select)[action](content)
   #
-  # Example:
   #
-  # ```coffee
+  # Examples
+  #
   #   editor.edit content,
   #       select: 'p:last'
   #       action: 'after'
   #       content: "<p>Hello world</p>"
-  # ```
   #
-  # ```coffee
   #   editor.edit content,
   #       select: 'p:last'
   #       action: 'after'
@@ -187,18 +193,17 @@ class StorageEditor
   #       template: 'list'
   #       data:
   #         items: [ {item: 1}, {item: 2}, {item: 3} ]
-  # ```
+  #
   #
   # If you override this method, basic skeleton is:
   #
-  # ```coffee
-  # class MyEditor extends StorageEditor
-  #   edit: (content, options) ->
-  #    $ = @beginEdit content
-  #    # namespace aware CSS selector
-  #    $("ac|structured-macro").replaceWith(...)
-  #    # manipulate content here using n
-  #    @endEdit()
+  #   class MyEditor extends StorageEditor
+  #     edit: (content, options) ->
+  #      $ = @beginEdit content
+  #      # namespace aware CSS selector
+  #      $("ac|structured-macro").replaceWith(...)
+  #      # manipulate content here using n
+  #      @endEdit()
   #
   # Usually
   #
@@ -218,6 +223,7 @@ class StorageEditor
             editAction($,@)
           else
             {select, action, content, template, templates, data} = editAction
+            templateData = data
 
             if templates
               unless templates instanceof Array
@@ -226,7 +232,7 @@ class StorageEditor
                 @['add'+type.replace(/^\w/, (m)->m.toUpperCase())](name, data)
 
             if template
-              content = @applyTemplate(template, data)
+              content = @applyTemplate(template, data: templateData)
 
             if select and action and content
               $(select)[action](content)

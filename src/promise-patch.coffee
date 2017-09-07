@@ -10,12 +10,16 @@ Promise.iterate = (funcs, callback) ->
       new Promise (resolve, reject) ->
         promised func
         .then (value) ->
-          callback value if callback
-          resolve value
+          if callback
+            promised callback value
+            .then resolve
+            .catch reject
+          else
+            resolve value
         .catch reject
 
-        if callback
-          callback value
+        # if callback
+        #   callback value
 
 # http://promise-nuggets.github.io/articles/16-map-limit.html
 Promise.parallel_experimental = (funcs, slots, callback) ->

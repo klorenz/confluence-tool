@@ -36,12 +36,19 @@ class PagePropEditor extends StorageEditor
 
   getList: ($, elem, data, selector, getItem)->
     list = []
-    # find list items
-    $(elem).find(selector).each (i,elem) =>
-      #userkey = $(this).attr('ri:userkey')
-      item = getItem elem
-      if item not in list
-        list.push item
+
+    if data.replace
+      for item in data.replace
+        if item not in list
+          list.push item
+
+    else
+      # find list items
+      $(elem).find(selector).each (i,elem) =>
+        #userkey = $(this).attr('ri:userkey')
+        item = getItem elem
+        if item not in list
+          list.push item
 
     if data.add
       for item in data.add
@@ -79,6 +86,8 @@ class PagePropEditor extends StorageEditor
 
     # structured data
     switch prop.type
+#      when 'list'
+
       when 'user'
         if prop.value
           data = userkey: prop.value

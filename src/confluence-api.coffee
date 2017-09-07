@@ -3,6 +3,9 @@ extend  = require('util')._extend
 StorageEditor = require './storage-editor'
 PagePropEditor = require './page-prop-editor'
 {jQuery} = StorageEditor
+fs = require 'fs'
+
+{unescape} = require 'querystring'
 
 {isHtml, promised} = require './util'
 require './promise-patch'
@@ -45,18 +48,19 @@ class ConfluenceAPI
         if error
           reject error
         else
-          debugger
           try
-            body = JSON.parse body
+            if typeof body is 'string'
+              body = JSON.parse body
 
             if body.statusCode? and body.statusCode >= 400
-              err = new Error "#{body.statusCode}: #{body.message}"
-              err.data = body
+              err = new Error "Body (#{opts.url}) #{body.statusCode}: #{body.message}"
+              delete opts.auth
+              err.data = {opts, body}
               reject err
             else
               resolve body
           catch e
-            err = new Error "#{response.statusCode}: #{response.statusMessage}"
+            err = new Error "Response (#{opts.url}) #{response.statusCode}: #{response.statusMessage} (#{e})"
             err.response = response
             reject err
 
@@ -131,6 +135,23 @@ class ConfluenceAPI
       .catch (error) ->
         reject error
 
+  # Public: extract propfilter query from list
+  #
+  # Items of the form name==value are filtered out a list.
+  #
+  # Returns a pair of items and propfilter.
+  getPagePropFilter: (list) ->
+    propquery = []
+    items = []
+    for item in list
+      if m = item.match /(.*?)==(.*)/
+        propquery.push name: m[1], value: m[2]
+      else
+        items.push item
+    return [items, propquery]
+
+  # Section: CQL
+
   # resolve some string variants to CQL queries
   #
   # * `ref` - resolve to a valid CQL
@@ -182,7 +203,10 @@ class ConfluenceAPI
         if result['size'] == 0
           reject new Error "page does not exist"
 
-        resolve result['results'][0]
+        page = result['results'][0]
+        page.spaceKey = page._expandable.space.match(/\/([^\/]*)$/)[1]
+
+        resolve page
       .catch(reject)
 
 
@@ -193,42 +217,153 @@ class ConfluenceAPI
     #console.log "search", query
     @get "/rest/api/content/search", qs: (extend {cql: query}, options)
 
+  # Public: Iterate over pages
+  #
   eachPage: (query, options, callback) ->
     #console.log "each page", query, options
     if options instanceof Function
       callback = options
       options = {}
 
+    pagePropFilter = null
+
+    #console.log "query", query
+    if typeof query is "object"
+      {query, pagePropFilter} = query
+
+    #console.log "query", query, "ppf", pagePropFilter
+    result = {size: 0, results: []}
+
     new Promise (resolve, reject) =>
-      getPages = (opts) =>
-        @search(query, opts)
-        .then (data) =>
-          #console.log "search data", query, opts
-          #console.log "results", data
+      promises = []
 
-          promises = []
+      if pagePropFilter
+        opts = extend({pagePropFilter}, options)
+        @getPageProperties query, opts, (props, page) =>
+          if callback
+            promises.push promised callback page
+          result.results.push page
+      else
+        getPages = (opts) =>
+          @search(query, opts)
+          .then (data) =>
+            #console.log "search data", query, opts
+            #console.log "results", data
+            result.size += data.size
 
-          for page in data['results']
-            page.spaceKey = page._expandable.space.match(/\/([^\/]*)$/)[1]
-            #console.log "handle", page
-            if callback
-              promises.push promised callback page
+            promises = []
 
-          Promise.all promises
-          .then ->
-            if data['size'] < data['limit']
-              resolve()
-            else
-              _opts = extend {}, opts
-              _opts.start += _opts.limit
+            for page in data['results']
+              page.spaceKey = page._expandable.space.match(/\/([^\/]*)$/)[1]
 
-              getPages(_opts)
+              if callback
+                promises.push promised callback page
+
+              result.results.push page
+
+            Promise.all promises
+            .then ->
+              if data['size'] < data['limit']
+                resolve result
+              else
+                _opts = extend {}, opts
+                _opts.start += _opts.limit
+
+                getPages(_opts)
+            .catch(reject)
           .catch(reject)
-        .catch(reject)
 
-      getPages extend {start: 0, limit: 25}, options
+        getPages extend {start: 0, limit: 25}, options
+
+  createPage: (page, editor) ->
+    new Promise (resolve, reject) =>
+      if page.parent
+        gotParent = @getPage(page.parent)
+      else
+        gotParent = Promise.resolve(null)
+
+      newPage = {}
+
+      gotParent
+      .then (parent) =>
+        #console.log "parent" ,parent
+        if page.page
+          if m = page.page.match /(\w+):(.*)/
+            newPage.title = m[2]
+            newPage.space = {key: m[1]}
+          else
+            newPage.title = page.page
+
+        if page.title
+          newPage.title = page.title
+
+        newPage.type = page.type or 'page'
+
+        if parent
+          {id,spaceKey} = parent
+          newPage.ancestors = [{id}]
+          newPage.space = {key: spaceKey}
+
+        if page.body.storage.value
+          {value, representation} = page.body.storage
+          newPage.body = {storage: {value, representation}}
+
+        else if page.body
+          value = page.body
+          newPage.body = {storage: {value, representation}}
+
+        @editPage newPage, editor
+        .then(resolve)
+        .catch(reject)
+      .catch(reject)
+
+#  curl -u admin:admin -X POST -H 'Content-Type: application/json' -d'{"type":"page","title":"new page",
+# "space":{"key":"TST"},"body":{"storage":{"value":"<p>This is a new page</p>","representation":
+# "storage"}}}' http://localhost:8080/confluence/rest/api/content/ | python -mjson.tool
+
+# curl -u admin:admin -X POST -H 'Content-Type: application/json' -d'{"type":"page","title":"new page",
+#  "ancestors":[{"id":456}], "space":{"key":"TST"},"body":{"storage":{"value":
+#  "<p>This is a new page</p>","representation":"storage"}}}'
+#  http://localhost:8080/confluence/rest/api/content/ | python -mjson.tool
+
+
+
+  # Comala Workflow
+  cwApprove: () ->
+    # request: POST Request URL:https://wiki.moduleworks.com/rest/adhocworkflows/latest/approval/68390821/approve
+    # body: {"name":"Request Approval","note":"test note"}
+    # response {"stateName":"Review","finalState":false,"versionsCompleted":false,"hasFinalState":true,"publishedView":false,"admin":false,"messages":[],"activeTasks":0,"taskable":true,"pageAssignable":false,"adhoc":false,"activityVisible":true,"actionable":true,"hideStates":false,"displayProgressTracker":true,"updatePageStatus":false,"changeExpirationDate":false,"expired":false,"orderedWorkflowStates":["Draft","Review","Approved"],"hoverDescription":"Review"}
+    #
+
+    # POST Request URL:https://wiki.moduleworks.com/rest/adhocworkflows/latest/approval/68390821/reject
+    # body {"name":"Approve and publish"}
+    # response {"stateName":"Draft","finalState":false,"versionsCompleted":false,"hasFinalState":true,"publishedView":false,"admin":false,"messages":[],"activeTasks":0,"taskable":true,"pageAssignable":false,"adhoc":false,"activityVisible":true,"actionable":true,"hideStates":false,"displayProgressTracker":true,"updatePageStatus":false,"changeExpirationDate":false,"expired":false,"orderedWorkflowStates":["Draft","Review","Approved"],"hoverDescription":"Draft"}
+
+    # change workflow for page
+    # Request URL:https://wiki.moduleworks.com/plugins/approvalsworkflow/saveworkflowmarkup.action
+    # POST
+    # Form data url-encoded:
+    #
+    #
+    # Request URL:https://wiki.moduleworks.com/rest/cw/1/markup/parse?expand=workflow
+    #
+    # List current available page workflows GET https://wiki.moduleworks.com/rest/cw/1/workflows/IT/pageworkflows (200)
+    # but not per page :(
+    #
+    # Add workflow:
+#Request URL:https://wiki.moduleworks.com/rest/adhocworkflows/latest/workflow/68390766/add
+# Body {"workflowId":"-1366119499","stateNames":"In Progress, Approved"}
+# Response: {"stateName":"Draft","finalState":false,"versionsCompleted":false,"hasFinalState":true,"publishedView":false,"admin":false,"messages":[],"activeTasks":0,"taskable":true,"pageAssignable":false,"adhoc":false,"activityVisible":true,"actionable":true,"hideStates":false,"displayProgressTracker":true,"updatePageStatus":false,"changeExpirationDate":false,"expired":false,"orderedWorkflowStates":["Draft","Validate","Review","Approved"],"hoverDescription":"Draft"}
+
+
+  addHocWorkflowReject: () ->
+  addHocWorkflowGet: () ->
+  addHocWorkflowSet: () ->
+
+
 
   addLabels: (query, labels, callback) ->
+
     labelData = for label in labels
       if mob = label.match /(.*):(.*)/
         prefix: mob[1], name: mob[2]
@@ -248,7 +383,9 @@ class ConfluenceAPI
             succeeded.push { page, data }
 
           if callback
-            callback page, data
+            promised callback page, data
+          else
+            Promise.resolve()
 
         .catch (error) =>
           errors.push { page, error }
@@ -270,28 +407,103 @@ class ConfluenceAPI
     bodyType  = options.bodyType ? "view"
     stripTags = options.stripTags ? true
 
+    {keys, pagePropFilter} = options
+    unless keys
+      keys = []
+
+    unless pagePropFilter
+      pagePropFilter = []
+
+    query_keys = (q.name for q in pagePropFilter)
+
     @eachPage cql, {expand: "body.#{bodyType}"}, (page) =>
       page.properties = props = {}
       $=jQuery(page.body.view.value)
 
       didCallback = []
 
-      $("div[data-macro-name=details] table > tbody th").each (i,elem) =>
+      $("div[data-macro-name=details] > div.table-wrap > table > tbody > tr > th").each (i,elem) =>
         key = $(elem).text().trim()
+
+        if keys.length
+          return unless key in keys or key in query_keys
 
         if stripTags
           extractData = ($e) =>
-            $x = $e.find('li, table th + td')
+            users = []
+            refs  = []
+            links = []
+            mailAddresses = []
 
-            if $x.length
-              if $x.get(0).tagName is 'li'
-                value = $e.find('li').map((i,e) -> extractData $(e)).get()
-              else
-                value = {}
-                $e.find('table th').each (i,e) =>
-                  value[$(e).text().trim()] = extractData $(e).next()
+            #console.log $e.find(':first')
+            if $e.children().eq(0).is('div.content-wrapper, ul') # is list
+              value = $e.find('li').map((i,e) -> extractData $(e)).get()
+            else if $e.children().eq(0).is('div.table-wrap, table')  # is table
+              value = {}
+              $e.find('table th').each (i,e) =>
+                value[$(e).text().trim()] = extractData $(e).next()
             else
-              value = $e.text().trim()
+
+          #  $x = $e.find('li, table th + td')
+
+            # if $x.length
+            #   if $x.get(0).tagName is 'li'
+            #     value = $e.find('li').map((i,e) -> extractData $(e)).get()
+            #   else
+            #     value = {}
+            #     $e.find('table th').each (i,e) =>
+            #       value[$(e).text().trim()] = extractData $(e).next()
+            # else
+              # create a local copy of the element to manipulate html without
+              # changing original
+
+              html = $e.html()
+
+              jq=jQuery("<div>#{html}</div>")
+
+              # wiki code
+              jq('a').each (i,elem) ->
+                if jq(elem).hasClass('confluence-userlink')
+                  username = jq(elem).attr('data-username')
+                  users.push {username}
+                  jq(elem).html("[~#{username}]")
+
+                else if jq(elem).attr('href').startsWith("mailto:")
+                  address = jq(elem).attr('href')[7...]
+                  mailAddresses.push address
+                  jq(elem).html(address)
+
+                else if jq(elem).hasClass('external-link')
+                  href = jq(elem).attr('href')
+                  caption = jq(elem).text()
+                  if caption != href
+                    jq(elem).html("[#{caption}|#{href}]")
+                    links.push {caption,href}
+                  else
+                    jq(elem).html("[#{href}]")
+                    links.push {href}
+
+                else
+                  if m = jq(elem).attr('href').match /\/display\/([\w-]*)\/(.*)/
+                    [space, title] = m[1...]
+                    title = unescape title.replace(/\+/g, " ")
+                    refs.push {space, title}
+                    jq(elem).html("[#{space}:#{title}]")
+
+              # simpleMarkup = (e) ->
+              #   jq('table, ul, ol').each (i,elem) ->
+              #     if jq(e).is('table')
+              #       jq('> thead, > tbody, > tfoot').map (i,part) ->
+              #
+              #       jq('thead > tr, tbody > tr').map (i,tr) ->
+              #         jq(tr).find('th,td').each (i,e) ->
+              #           if jq(e).is('th')
+              #             || $(e).text()
+
+              value = jq(':root').text().trim()
+
+            if options.data
+              {value, html: $e.html(), users, refs, links, mailAdresses}
 
             return value
 
@@ -301,11 +513,26 @@ class ConfluenceAPI
 
         props[key] = value
 
-      if callback
-        didCallback.push promised callback props, page
+      match = true
+      if pagePropFilter.length
+        for q in pagePropFilter
+          match = match and if q.name of props
+            value = (props[q.name].value or props[q.name])
+            if q.name not in keys
+              delete props[q.name]
+            if value instanceof Array
+              value.includes q.value
+            else
+              value is q.value
+          else
+            false
 
-      Promise.all didCallback
-
+      return if not match
+        Promise.resolve()
+      else if callback
+        promised callback props, page
+      else
+        Promise.resolve()
 
 
   # Section: Page Properties
@@ -327,7 +554,6 @@ class ConfluenceAPI
 
       # first collect pages using CQL to find out about the spaces
       @eachPage cql, (page) ->
-        #console.log "pageid", page.id
         if not pagesPerSpace[page.spaceKey]
           pagesPerSpace[page.spaceKey] = []
 
@@ -414,7 +640,6 @@ class ConfluenceAPI
 
         Promise.all gotSpaceSet
         .then (results) ->
-          #console.log "results", results
           result =
             currentPage: 0
             totalPages: 0
@@ -423,7 +648,6 @@ class ConfluenceAPI
             asyncRenderSafe: true
 
           for value in results
-            #console.log "value", results
             continue unless value.detailLines
             for detail in value.detailLines
               result.detailLines.push detail
@@ -443,10 +667,6 @@ class ConfluenceAPI
       else
         version = number: parseInt(page.version) + 1
 
-    # page.spaceKey is undefined here
-    #console.log "spaceKey", page.spaceKey
-    #space = page.space.key
-
     representation = null
     value = null
 
@@ -463,18 +683,27 @@ class ConfluenceAPI
     else if page.body.storage # assume data is setup correct
       {value, representation} = page.body.storage
 
-
     type = page.type or 'page'
 
-    data = {id, title, type, version}
+    data = {title, type}
 
     if value?
       representation ?= if isHtml(value) then 'storage' else 'wiki'
       data.body = storage: {value, representation}
 
-    #console.log "updatePage", data
+    if page.ancestors
+      data.ancestors = page.ancestors
+    if page.space
+      data.space = page.space
 
-    @put "/rest/api/content/#{id}", json: data
+    #console.log "data", data
+
+    if id
+      data.id = id
+      data.version = version
+      @put "/rest/api/content/#{id}", json: data
+    else
+      @post "/rest/api/content/", json: data
 
   # Public: edito a page
   #
@@ -502,7 +731,7 @@ class ConfluenceAPI
   editPage: (page, editor) ->
     #console.log "page", page
     new Promise (resolve, reject) =>
-      if typeof page is 'object' and page.version and page.body
+      if typeof page is 'object' and page.body and ((page.id and page.version) or not page.id)
         gotPage = Promise.resolve(page)
       else
         gotPage = @getPage page, 'version,body.storage'
@@ -517,7 +746,8 @@ class ConfluenceAPI
             value = editor.edit page
           else
             myEditor = new StorageEditor
-            value = myEditor.edit page, editor.edit
+            debugger
+            value = myEditor.edit page, editor
 
         else if typeof editor is 'function'
           value = editor page
@@ -533,6 +763,9 @@ class ConfluenceAPI
             updatedPage = extend page {newBody: editor}
           else if typeof editor is 'object'
             updatedPage = extend page, value
+
+          #console.log "page", page
+          #console.log "updated page", updatedPage
 
           @updatePage updatedPage
           .then(resolve).catch (error) ->
@@ -573,29 +806,71 @@ class ConfluenceAPI
   # - resolve user names to userkeys
   #
   preparePageProperties: (props) ->
+    extractData = (prop) ->
+      new Promise (resolve, reject) ->
+        if prop instanceof Array
+          Promise.all prop.map (val) ->
+            extractData(val)
+          .then (values) ->
+            resolve {
+              type: 'list'
+              replace: values
+            }
+          .catch reject
+        else
+          if m = prop.match /^\[~(.*)\]$/
+            @getUser(m[1])
+            .then (data) ->
+              resolve {
+                type: 'user'
+                value: data.userKey
+              }
+            .catch reject
+          else if m = prop.match /^\[(\w+:.*)\]$/
+            resolve {
+              type: 'page'
+              value: m[1]
+            }
+          else
+            resolve value
+
     new Promise (resolve, reject) ->
       promises = []
-      for key, prop of props
+      for key of props
+        prop = props[key]
+
         continue if typeof prop is 'string'
+        #if typeof prop is 'string'
+        #  promises.push extractData(prop).then ()
+
+        # if prop instanceof Array
+        #   for val in prop
+        #     promises.push @
+        #     for val
+        #   # replace current array with this array
 
         if 'value' of prop and ('add' of prop or 'remove' of prop)
           throw new Error "invalid prop data, either value or add/remove"
 
-        if prop.type is 'user'
+        else if prop.type is 'user'
           if 'value' of prop
             do (prop) =>
               prop.valueOrig = prop.value
               promises.push @getUser(prop.value).then (data) ->
                 prop.value = data.userKey
 
+          # TODO: make this work!!
           for k in ['add', 'remove']
             do (prop, k) =>
               prop[k+'Orig'] = vals = prop[k]
-              gotVals = for val in vals
-                @getuser(val).then (data) ->
-                  prop[k] = value
-
-              promises.push Promise.all(gotVals)
+              prop[k] = []
+              promises.push Promise.iterate vals.map (val) =>
+                new Promise (resolve, reject) ->
+                  @getUser(val)
+                  .then (data) ->
+                    prop[k].push data.userKey
+                    resolve(data.userKey)
+                  .catch(reject)
 
 #        if prop.type is ''
 
@@ -636,8 +911,7 @@ class ConfluenceAPI
   #
   # * `options`, which can be one options {Object} or an array of option objects
   #   One option object may have following keys:
-  #
-  #   * `page` or `cql`, which both resolve internally to a CQL, if you have
+  # #   * `page` or `cql`, which both resolve internally to a CQL, if you have
   #   * `properties` {Object} with names as keys.  Values may be either {String}
   #     or {Object}:
   #
@@ -653,8 +927,6 @@ class ConfluenceAPI
     if options not instanceof Array
       options = [ options ]
 
-    #console.log "options", options
-
     Promise.iterate options.map (option) =>
       new Promise (resolve, reject) =>
         @preparePageProperties(option.properties)
@@ -662,14 +934,10 @@ class ConfluenceAPI
           if option.cql and option.page
             thow new Error "You may only pass either 'cql' or 'page'"
 
-          #console.log "apply", option
-
           pagePropEditor = new PagePropEditor option
 
           cql = option.cql or @resolveCQL option.page
           @eachPage cql, {expand: 'version,body.storage'}, (page) =>
-            #console.log "handle page", page.id
-
             new Promise (resolve, reject) =>
               @editPage page.id, pagePropEditor
               .then (value) ->
@@ -677,7 +945,53 @@ class ConfluenceAPI
                   callback value
                 resolve value
               .catch(reject)
-          .then(resolve)
+          .then (result) =>
+            resolve result if result['size'] > 0
+            resolve result unless m = option.page.match /(\w+):(.*)/
+
+            #option = options[0]
+
+            [space,title] = m[1...]
+
+            # prepare page
+            contentfile = "#{__dirname}/templates/page-props.html"
+            content = fs.readFileSync(contentfile).toString()
+
+            page = {
+              body: {storage: {value: content, representation: "storage"}}
+              space: {key: space}
+              title: title
+            }
+
+            if option.parent
+              page.parent = option.parent
+
+            createPage = =>
+              data = []
+              do (data) =>
+                for key, value of option.properties
+                  data.push {key,value}
+
+                @createPage page, edit: {
+                    templates: [{
+                        name: "pageprops"
+                        type: "template"
+                        data: """
+                          {{#each data}}
+                            <tr><th>{{key}}</th><td>{{{value}}}</td></tr>
+                          {{/each}}
+                        """
+                      }]
+                    template: "pageprops"
+                    data: data
+                    select: "tbody"
+                    action: "html"
+                  }
+                .then(resolve)
+                .catch(reject)
+
+            createPage()
+
           .catch(reject)
 
         .catch(reject)

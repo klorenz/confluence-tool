@@ -1,5 +1,8 @@
 {
   "name": "confluence-tool",
+  "bin": {
+    "ct": "./src/cli.coffee"
+  },
   "version": "0.1.1",
   "description": "library to access atlassian REST API",
   "main": "index.js",
